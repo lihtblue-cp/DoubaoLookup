@@ -3,21 +3,33 @@ import Cocoa
 class MenuBarController {
 
     private var statusItem: NSStatusItem!
+    private weak var appDelegate: AppDelegate?
 
-    init() {
+    init(appDelegate: AppDelegate) {
+        self.appDelegate = appDelegate
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
-        if let button = statusItem.button {
-            button.title = "豆"
-            button.font = NSFont.systemFont(ofSize: 13, weight: .medium)
-            button.toolTip = "豆包查询 — ⌃⌥A 查询选中文本"
-        }
+        guard let button = statusItem.button else { return }
+
+        button.title = "豆"
+        button.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        button.toolTip = "豆包查询 — 点击菜单"
 
         buildMenu()
     }
 
     private func buildMenu() {
         let menu = NSMenu()
+
+        let showItem = NSMenuItem(
+            title: "显示/隐藏浮窗",
+            action: #selector(toggleWindow),
+            keyEquivalent: ""
+        )
+        showItem.target = self
+        menu.addItem(showItem)
+
+        menu.addItem(NSMenuItem.separator())
 
         let lookupItem = NSMenuItem(
             title: "查询选中文本  ⌃⌥A",
@@ -47,6 +59,18 @@ class MenuBarController {
         menu.addItem(quitItem)
 
         statusItem.menu = menu
+    }
+
+    // MARK: - Actions
+
+    @objc private func toggleWindow() {
+        guard let floatingWindow = appDelegate?.floatingWebWindow else { return }
+        if let window = floatingWindow.window, window.isVisible {
+            window.makeKey()
+            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            floatingWindow.restore()
+        }
     }
 
     @objc private func showAbout() {

@@ -1,11 +1,12 @@
 import Cocoa
 import Carbon
 
+@main
 class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var menuBarController: MenuBarController!
     private var textSelectionManager: TextSelectionManager!
-    private var floatingWebWindow: FloatingWebWindowController!
+    var floatingWebWindow: FloatingWebWindowController!
 
     // ─── 可自定义的快捷键 KeyCode ─────────────────────────────────
     // 常用 KeyCode: A=0, C=8, D=2, E=14, F=3, L=37, Q=12, Space=49
@@ -19,7 +20,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
 
         // 初始化各模块
-        menuBarController = MenuBarController()
+        menuBarController = MenuBarController(appDelegate: self)
         textSelectionManager = TextSelectionManager()
         floatingWebWindow = FloatingWebWindowController()
 
@@ -42,6 +43,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// 执行查询：获取选中文本 → 打开悬浮窗 → 发豆包
     @objc func performLookup() {
+        // 1. 检查辅助功能权限（未授权时只弹权限窗，不弹其他窗）
+        guard textSelectionManager.isPermissionGranted else {
+            showPermissionAlert()
+            return
+        }
+
+        // 2. 获取选中文本
         guard let selectedText = textSelectionManager.getSelectedText(),
               !selectedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             showNoSelectionNotification()
@@ -52,18 +60,46 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         floatingWebWindow.search(query: trimmed)
     }
 
-    // MARK: - 通知 / 提示
+    // MARK: - 提示
 
+    /// 权限未授权时的引导提示（只弹这一个，不连锁弹窗）
+    private func showPermissionAlert() {
+        let alert = NSAlert()
+        alert.messageText = "需要辅助功能权限"
+        alert.informativeText = """
+        豆包查询需要「辅助功能」权限来读取选中的文本。
+
+        请在系统设置中确保已添加本应用：
+        系统设置 → 隐私与安全性 → 辅助功能
+
+        如果已添加但仍无法使用，请尝试：
+        1. 在列表中移除本应用
+        2. 点击下方按钮，重新授权
+        """
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "打开系统设置")
+        alert.addButton(withTitle: "取消")
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            textSelectionManager.requestPermissionIfNeeded()
+        }
+    }
+
+    /// 未选中文本时的提示
     private func showNoSelectionNotification() {
+        // 检查是否已提示过，避免每次按快捷键都弹窗
+        let hasShown = UserDefaults.standard.bool(forKey: "hasShownNoSelectionHint")
+        if hasShown { return }
+
         let alert = NSAlert()
         alert.messageText = "豆包查询"
         alert.informativeText = "未检测到选中的文本。\n请先选中文本再按 ⌃⌥A 查询。"
         alert.alertStyle = .informational
-        alert.addButton(withTitle: "好的")
-        if let window = floatingWebWindow.window, window.isVisible {
-            alert.beginSheetModal(for: window, completionHandler: nil)
-        } else {
-            alert.runModal()
+        alert.addButton(withTitle: "不再提示")
+        alert.addButton(withTitle: "知道了")
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            UserDefaults.standard.set(true, forKey: "hasShownNoSelectionHint")
         }
     }
 
