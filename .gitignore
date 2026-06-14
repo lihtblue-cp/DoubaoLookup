@@ -1,3 +1,6 @@
 .build/
 豆包查询.app/
+豆包查询.dmg
+豆包查询.zip
+*-backup/
 .DS_Store

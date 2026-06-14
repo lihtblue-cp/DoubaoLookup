@@ -9,13 +9,13 @@ class DragHandleView: NSView {
 }
 
 /// 悬浮在鼠标旁的 WKWebView 窗口。
-/// 加载 doubao.com 后通过 CGEvent 模拟键盘输入（非 JS 注入）以正确适配 React SPA。
 class FloatingWebWindowController: NSWindowController, WKNavigationDelegate, NSWindowDelegate {
 
     private var webView: WKWebView!
     private var pendingQuery: String?
-    private var loadingLabel: NSTextField!
     private var injectionTimer: Timer?
+    private var pageLoaded = false
+    private var searchCompletion: ((Bool) -> Void)?
 
     private static let defaultWindowSize = NSSize(width: 480, height: 600)
     private static let maxRetries = 30
@@ -33,53 +33,62 @@ class FloatingWebWindowController: NSWindowController, WKNavigationDelegate, NSW
 
     // ── 公开接口 ──
 
-    /// 查询豆包
-    func search(query: String) {
-        if let url = webView.url, url.absoluteString.contains("doubao.com"),
-           window?.isVisible == true {
-            injectionTimer?.invalidate()
-            pendingQuery = query
-            updateLoadingMessage("正在查询...")
-            startPollingForInput()
-            return
-        }
+    var webViewForCookieStore: WKWebView? { webView }
 
+    /// 查询豆包（后台执行，完成后通过 completion 回调）
+    func search(query: String, completion: @escaping (Bool) -> Void = { _ in }) {
         injectionTimer?.invalidate()
         pendingQuery = query
-        positionNearMouse()
         window?.delegate = self
-        loadingLabel.isHidden = false
-        loadingLabel.stringValue = "正在加载..."
-        webView.isHidden = true
+        searchCompletion = completion
+        let mode = UserDefaults.standard.string(forKey: "queryMode") ?? "new"
 
-        showWindow(nil)
-        window?.makeKey()
-        window?.alphaValue = 0
-        NSApp.activate(ignoringOtherApps: true)
-
-        if let url = URL(string: "https://www.doubao.com/chat") {
-            webView.load(URLRequest(url: url))
+        // 预先定位窗口（暂不显示）
+        if let win = window, !win.isVisible {
+            positionNearMouse()
+            win.alphaValue = 1.0
         }
+
+        if mode == "continue" && pageLoaded {
+            // 继续对话：不重刷页面，直接注入
+            tryFocusInput()
+        } else {
+            // 新对话（或首次加载）：重刷页面
+            pageLoaded = false
+            if let url = URL(string: "https://www.doubao.com/chat") {
+                var req = URLRequest(url: url)
+                req.cachePolicy = .returnCacheDataElseLoad
+                webView.load(req)
+            }
+        }
+    }
+
+    /// 查询完成后显示浮窗
+    func showSearchResult() {
+        guard let win = window else { return }
+        positionNearMouse()
+        win.alphaValue = 1.0
+        win.delegate = self
+        win.orderFrontRegardless()
+        win.makeKey()
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     override func showWindow(_ sender: Any?) {
         window?.orderFrontRegardless()
     }
 
-    /// 显示已关闭的浮窗（不重新加载页面）
     @objc func restore() {
-        guard let window = window else { return }
-        if window.isVisible {
-            window.makeKey(); NSApp.activate(ignoringOtherApps: true)
+        guard let win = window else { return }
+        if win.isVisible {
+            win.makeKey(); NSApp.activate(ignoringOtherApps: true)
             return
         }
         positionNearMouse()
-        window.delegate = self
-        loadingLabel.isHidden = true
-        webView.isHidden = false
-        window.alphaValue = 1.0
-        showWindow(nil)
-        window.makeKey()
+        win.delegate = self
+        win.alphaValue = 1.0
+        win.orderFrontRegardless()
+        win.makeKey()
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -89,6 +98,27 @@ class FloatingWebWindowController: NSWindowController, WKNavigationDelegate, NSW
         window?.orderOut(nil)
         window?.alphaValue = 0
         pendingQuery = nil
+    }
+
+    // ── 导航到登录页 ──
+
+    func navigateToLogin() {
+        if let url = URL(string: "https://www.doubao.com/chat") {
+            var req = URLRequest(url: url)
+            req.cachePolicy = .reloadIgnoringLocalCacheData
+            webView.load(req)
+        }
+        // 显示窗口让用户看到登录页
+        showSearchResult()
+    }
+
+    func clearCookies(completion: @escaping () -> Void = {}) {
+        let store = WKWebsiteDataStore.default()
+        store.fetchDataRecords(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes()) { records in
+            store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
+                           for: records,
+                           completionHandler: completion)
+        }
     }
 
     // ── 窗口创建 ──
@@ -111,45 +141,57 @@ class FloatingWebWindowController: NSWindowController, WKNavigationDelegate, NSW
         return window
     }
 
-    private let barHeight: CGFloat = 24
+    private let barHeight: CGFloat = 28
 
     private func setupUI() {
         guard let v = window?.contentView else { return }
         let webFrame = NSRect(x: 0, y: 0, width: v.bounds.width, height: v.bounds.height - barHeight)
 
+        // WebView
         let config = WKWebViewConfiguration()
         config.websiteDataStore = WKWebsiteDataStore.default()
         webView = WKWebView(frame: webFrame, configuration: config)
         webView.autoresizingMask = [.width, .height]
         webView.navigationDelegate = self
-        webView.isHidden = true
         v.addSubview(webView)
 
-        loadingLabel = NSTextField(labelWithString: "正在加载...")
-        loadingLabel.font = NSFont.systemFont(ofSize: 15)
-        loadingLabel.textColor = .secondaryLabelColor
-        loadingLabel.alignment = .center
-        loadingLabel.frame = webFrame
-        loadingLabel.autoresizingMask = [.width, .height]
-        v.addSubview(loadingLabel)
+        // ── 拖动条 ──
+        let barFrame = NSRect(x: 0, y: v.bounds.height - barHeight, width: v.bounds.width, height: barHeight)
+        let bar = DragHandleView(frame: barFrame)
+        bar.autoresizingMask = [.width, .minYMargin]
+        bar.wantsLayer = true
+        bar.layer!.backgroundColor = NSColor.controlBackgroundColor.cgColor
 
-        let handle = DragHandleView(
-            frame: NSRect(x: 0, y: v.bounds.height - barHeight, width: v.bounds.width, height: barHeight)
-        )
-        handle.autoresizingMask = [.width, .minYMargin]
-        handle.wantsLayer = true
-        handle.layer!.backgroundColor = NSColor.controlBackgroundColor.cgColor
-        handle.layer!.borderColor = NSColor.separatorColor.withAlphaComponent(0.3).cgColor
-        handle.layer!.borderWidth = 0.5
+        let line = NSView(frame: NSRect(x: 0, y: 0, width: barFrame.width, height: 0.5))
+        line.wantsLayer = true
+        line.layer!.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.3).cgColor
+        line.autoresizingMask = [.width, .maxYMargin]
+        bar.addSubview(line)
 
         let hint = NSTextField(labelWithString: "⠿ 拖拽移动")
-        hint.font = NSFont.systemFont(ofSize: 10)
+        hint.font = NSFont.systemFont(ofSize: 11, weight: .regular)
         hint.textColor = .secondaryLabelColor
         hint.alignment = .center
-        hint.frame = handle.bounds
+        hint.frame = NSRect(x: 0, y: 0, width: barFrame.width - 40, height: barFrame.height)
         hint.autoresizingMask = [.width, .height]
-        handle.addSubview(hint)
-        v.addSubview(handle)
+        bar.addSubview(hint)
+
+        let closeBtn = NSButton(frame: NSRect(x: barFrame.width - 24, y: (barFrame.height - 16) / 2, width: 16, height: 16))
+        closeBtn.autoresizingMask = [.minXMargin]
+        closeBtn.bezelStyle = .circular
+        closeBtn.isBordered = false
+        closeBtn.title = ""
+        closeBtn.toolTip = "关闭"
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+        closeBtn.attributedTitle = NSAttributedString(string: "✕", attributes: attrs)
+        closeBtn.target = self
+        closeBtn.action = #selector(closeFloatingWindow)
+        bar.addSubview(closeBtn)
+
+        v.addSubview(bar)
     }
 
     // ── 窗口定位 ──
@@ -173,18 +215,16 @@ class FloatingWebWindowController: NSWindowController, WKNavigationDelegate, NSW
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard webView.url?.absoluteString.contains("doubao.com") == true else { return }
-        updateLoadingMessage("正在准备...")
+        pageLoaded = true
         startPollingForInput()
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        updateLoadingMessage("加载失败")
-        showWindowAfterDelay()
+        completeSearch(success: false)
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        updateLoadingMessage("无法访问豆包，请检查网络")
-        showWindowAfterDelay()
+        completeSearch(success: false)
     }
 
     // ── 查找输入框并聚焦（JS 轮询）──
@@ -192,13 +232,13 @@ class FloatingWebWindowController: NSWindowController, WKNavigationDelegate, NSW
     private func startPollingForInput() {
         injectionTimer?.invalidate()
         var retries = 0
+        tryFocusInput()
         injectionTimer = Timer.scheduledTimer(withTimeInterval: Self.retryInterval, repeats: true) { [weak self] timer in
             guard let self = self else { return }
             retries += 1
             if retries > Self.maxRetries {
                 timer.invalidate()
-                self.updateLoadingMessage("加载超时，请手动输入")
-                self.showWindowAfterDelay()
+                self.completeSearch(success: false)
                 return
             }
             self.tryFocusInput()
@@ -208,67 +248,165 @@ class FloatingWebWindowController: NSWindowController, WKNavigationDelegate, NSW
     private func tryFocusInput() {
         let js = """
         (function() {
-            for (var sel of ['textarea','div[contenteditable]','div[role="textbox"]','input[type="text"]']) {
-                for (var el of document.querySelectorAll(sel)) {
-                    if (el.offsetParent !== null) { el.focus(); el.click(); return true; }
+            var el = document.activeElement;
+            if (el && el !== document.body && el !== document.documentElement) {
+                if (el.offsetParent !== null) {
+                    el.focus(); return el.tagName;
                 }
             }
-            return false;
+            for (var sel of ['textarea','div[contenteditable]','div[role="textbox"]','input[type="text"]']) {
+                for (var e of document.querySelectorAll(sel)) {
+                    if (e.offsetParent !== null) { e.focus(); e.click(); return e.tagName; }
+                }
+            }
+            return '';
         })();
         """
         webView.evaluateJavaScript(js) { [weak self] result, error in
             guard let self = self, let query = self.pendingQuery, error == nil,
-                  let ok = result as? Bool, ok else { return }
+                  let tag = result as? String, !tag.isEmpty else { return }
             self.injectionTimer?.invalidate()
-            self.updateLoadingMessage("正在输入...")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                self.sendTextAndSubmit(query)
+            self.window?.makeFirstResponder(self.webView)
+
+            // 统一使用 JS 注入（execCommand 生成 trusted input 事件）
+            self.injectTextViaJS(query)
+        }
+    }
+
+    // ── JS 注入文字 + 按钮点击（两种模式通用）──
+
+    private func injectTextViaJS(_ text: String) {
+        let escaped = text.replacingOccurrences(of: "\\", with: "\\\\")
+                          .replacingOccurrences(of: "'", with: "\\'")
+                          .replacingOccurrences(of: "\n", with: "\\n")
+
+        let js = """
+        (function() {
+            var t = '\(escaped)';
+            var el = document.querySelector('div[contenteditable]') ||
+                     document.querySelector('textarea') ||
+                     document.querySelector('div[role="textbox"]');
+            if (!el || el.offsetParent === null) return 'no-input';
+
+            el.focus();
+
+            // 清空已有内容
+            if (el.isContentEditable) { el.textContent = ''; }
+            else { el.value = ''; }
+
+            // execCommand 生成 trusted input 事件 → React onChange
+            try {
+                document.execCommand('insertText', false, t);
+            } catch(e) {
+                if (el.isContentEditable) { el.textContent = t; }
+                else { el.value = t; }
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+            }
+
+            return 'text-inserted';
+        })();
+        """
+        webView.evaluateJavaScript(js) { [weak self] result, error in
+            guard let self = self else { return }
+            let r = result as? String ?? ""
+            if error != nil || r == "no-input" {
+                self.fallbackToReload()
+                return
+            }
+
+            // 等待 React 处理，然后找发送按钮点击（最多重试 20 次）
+            self.tryClickSendButton(retries: 20) { success in
+                if success {
+                    self.completeSearch(success: true)
+                } else {
+                    // 回退到 CGEvent Enter
+                    self.fallbackToCGEventEnter()
+                }
             }
         }
     }
 
-    // ── CGEvent 输入 ──
+    // ── CGEvent Enter 回退 ──
 
-    /// 一次性发送文本 + Enter（不再分块递归）
-    private func sendTextAndSubmit(_ text: String) {
-        let chars = Array(text.utf16)
-        guard let src = CGEventSource(stateID: .hidSystemState),
-              let kd = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true),
-              let ku = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false),
-              let ed = CGEvent(keyboardEventSource: src, virtualKey: 0x24, keyDown: true),
-              let eu = CGEvent(keyboardEventSource: src, virtualKey: 0x24, keyDown: false) else {
-            showWindowAfterDelay(); return
+    private func fallbackToCGEventEnter() {
+        guard let ed = CGEvent(keyboardEventSource: nil, virtualKey: 0x24, keyDown: true),
+              let eu = CGEvent(keyboardEventSource: nil, virtualKey: 0x24, keyDown: false) else {
+            completeSearch(success: false)
+            return
         }
-
-        kd.keyboardSetUnicodeString(stringLength: chars.count, unicodeString: chars)
-        ku.keyboardSetUnicodeString(stringLength: chars.count, unicodeString: chars)
-        kd.post(tap: .cghidEventTap)
-        usleep(50_000)
-        ku.post(tap: .cghidEventTap)
-        usleep(100_000)
-        ed.post(tap: .cghidEventTap)
-        usleep(30_000)
-        eu.post(tap: .cghidEventTap)
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            self.updateLoadingMessage("等待回答...")
-            self.showWindowAfterDelay()
+        // CGEvent 需要窗口激活
+        showSearchResult()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            ed.post(tap: .cgAnnotatedSessionEventTap)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                eu.post(tap: .cgAnnotatedSessionEventTap)
+                self.completeSearch(success: true)
+            }
         }
     }
 
-    // ── 窗口显示 ──
+    /// 轮询查找发送按钮并点击（最多 20 次，每次间隔 100ms）
+    private func tryClickSendButton(retries: Int, completion: @escaping (Bool) -> Void) {
+        guard retries > 0 else { completion(false); return }
 
-    private func updateLoadingMessage(_ msg: String) {
-        loadingLabel.stringValue = msg
+        let js = """
+        (function() {
+            var btns = document.querySelectorAll('button');
+            for (var i = 0; i < btns.length; i++) {
+                var b = btns[i];
+                if (b.offsetParent === null || b.disabled) continue;
+                var a = (b.getAttribute('aria-label') || '').toLowerCase();
+                var c = (b.textContent || '').trim().toLowerCase();
+                var d = (b.getAttribute('data-testid') || '').toLowerCase();
+                if (a.includes('发送') || a.includes('send') ||
+                    c === '发送' || c === 'send' || c === '↵' ||
+                    d.includes('send') || d.includes('submit')) {
+                    b.click();
+                    return 'clicked';
+                }
+            }
+            var all = document.querySelectorAll('[role="button"], [class*="send"], [class*="发送"], [class*="submit"]');
+            for (var i = 0; i < all.length; i++) {
+                var el = all[i];
+                if (el.tagName === 'BUTTON') continue;
+                if (el.offsetParent === null || el.disabled) continue;
+                var a = (el.getAttribute('aria-label') || '').toLowerCase();
+                var c = (el.textContent || '').trim().toLowerCase();
+                if (a.includes('发送') || a.includes('send') || c === '发送' || c === 'send') {
+                    el.click();
+                    return 'clicked-alt';
+                }
+            }
+            return 'not-found';
+        })();
+        """
+        webView.evaluateJavaScript(js) { [weak self] result, error in
+            if error != nil { completion(false); return }
+            let r = result as? String ?? ""
+            if r == "clicked" || r == "clicked-alt" {
+                completion(true)
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                self?.tryClickSendButton(retries: retries - 1, completion: completion)
+            }
+        }
     }
 
-    private func showWindowAfterDelay() {
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.2
-            self.window?.animator().alphaValue = 1.0
+    /// 回退：重置并重刷页面
+    private func fallbackToReload() {
+        pageLoaded = false
+        guard let query = pendingQuery else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.search(query: query, completion: self?.searchCompletion ?? { _ in })
         }
-        loadingLabel.isHidden = true
-        webView.isHidden = false
+    }
+
+    // MARK: - 完成回调
+
+    private func completeSearch(success: Bool) {
+        searchCompletion?(success)
+        searchCompletion = nil
     }
 
     private func clamp(_ value: CGFloat, min: CGFloat, max: CGFloat) -> CGFloat {
