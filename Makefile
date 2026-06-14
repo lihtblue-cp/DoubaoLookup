@@ -62,6 +62,26 @@ app: build
 run: app
 	open "$(APP_NAME)"
 
+# 发布新版本
+# 用法: make release VERSION=1.2
+# 该命令会：构建 app → 打包 DMG → 创建 GitHub Release 并上传
+release: app
+	@if [ -z "$(VERSION)" ]; then echo "用法: make release VERSION=x.y"; exit 1; fi
+	@DIR=$$(mktemp -d); \
+		cp -R "$(APP_NAME)" "$$DIR/"; \
+		ln -s /Applications "$$DIR/Applications"; \
+		hdiutil create -volname "豆包查询" -srcfolder "$$DIR" -ov -format UDZO "豆包查询.dmg" 2>/dev/null; \
+		rm -rf "$$DIR"
+	@echo "✅ DMG 打包完成"
+	git tag -f "$(VERSION)"
+	git push origin "$(VERSION)" -f
+	@echo "✅ 标签 $(VERSION) 已推送"
+	gh release create "$(VERSION)" \
+		--title "豆包查询 v$(VERSION)" \
+		--notes "请参见 README.md 了解更新内容。" \
+		"豆包查询.dmg#DoubaoLookup_Mac.dmg"
+	@echo "✅ Release v$(VERSION) 已发布"
+
 clean:
 	rm -rf "$(BUILD_DIR)"
 	rm -rf "$(APP_NAME)"
